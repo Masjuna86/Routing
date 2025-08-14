@@ -1,0 +1,14 @@
+/system script
+add name=AutoQueue12M source="
+:foreach i in=[/ip dhcp-server lease find] do={
+  :local ip [/ip dhcp-server lease get \$i address]
+  :local host [/ip dhcp-server lease get \$i host-name]
+  :if ([/queue simple find name=\$ip] = \"\") do={
+    /queue simple add name=\$ip target=\$ip max-limit=12M/12M comment=\$host
+  }
+}
+"
+
+# Jalankan setiap 1 menit
+/system scheduler
+add name=AutoQueue12M interval=1m on-event=AutoQueue12M
