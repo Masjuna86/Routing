@@ -1,0 +1,148 @@
+# =========================
+# PCC 3 ISP (500/500/250) + Auto Simple Queue 12Mbps per-device
+# ROS 7 - RB4011
+# =========================
+
+:log info "Start apply PCC(2:2:1) + Auto SimpleQueue(12M) script"
+
+# --- Hati-hati: hapus rule lama yang dibuat dengan comment khusus (aman) ---
+/ip firewall mangle remove [find where comment~"PCC-"]
+/ip route remove [find where comment~"PCC-LB"]
+/ip firewall nat remove [find where comment~"NAT-WAN"]
+/queue simple remove [find where comment~"AUTOQ"]
+/queue simple remove [find where comment~"LIVE_ENCODER_Q"]
+
+# =========================
+# 0) Konfigurasi dasar (sesuaikan jika beda)
+# =========================
+# Nama interface & gateway (ubah sesuai kondisi bila berbeda)
+:local IF1 "ether1-WAN1"
+:local IF2 "ether2-WAN2"
+:local IF3 "ether3-WAN3"
+:local GW1 "172.16.20.1"
+:local GW2 "172.16.30.1"
+:local GW3 "172.16.40.1"
+# Nama bridge LAN (ubah bila bukan 'Client' atau 'bridge')
+:local LANBR "Client"
+
+# =========================
+# 1) NAT per-WAN (masquerade)
+# =========================
+/ip firewall nat
+add chain=srcnat out-interface=$IF1 action=masquerade comment="NAT-WAN1"
+add chain=srcnat out-interface=$IF2 action=masquerade comment="NAT-WAN2"
+add chain=srcnat out-interface=$IF3 action=masquerade comment="NAT-WAN3"
+
+# =========================
+# 2) Bypass LAN-LAN dan ke router
+# =========================
+/ip firewall address-list
+add list=RFC1918 address=10.0.0.0/8
+add list=RFC1918 address=172.16.0.0/12
+add list=RFC1918 address=192.168.0.0/16
+
+/ip firewall mangle
+add chain=prerouting src-address-list=RFC1918 dst-address-list=RFC1918 action=accept comment="PCC-Bypass-LAN"
+add chain=prerouting dst-address-type=local action=accept comment="PCC-Bypass-Router"
+
+# =========================
+# 3) Stickiness (mark conn untuk koneksi masuk dari tiap WAN)
+# =========================
+add chain=prerouting in-interface=$IF1 connection-mark=no-mark action=mark-connection new-connection-mark=wan1_conn passthrough=yes comment="PCC-Stickiness-IN-WAN1"
+add chain=prerouting in-interface=$IF2 connection-mark=no-mark action=mark-connection new-connection-mark=wan2_conn passthrough=yes comment="PCC-Stickiness-IN-WAN2"
+add chain=prerouting in-interface=$IF3 connection-mark=no-mark action=mark-connection new-connection-mark=wan3_conn passthrough=yes comment="PCC-Stickiness-IN-WAN3"
+
+# =========================
+# 4) Define LIVE_ENCODER group (dikecualikan dari auto-queue)
+/ip firewall address-list
+add list=LIVE_ENCODER address=192.168.20.0/24 comment="Encoder Live group"
+# =========================
+
+# 5) PRIORITAS ENCODER: tandai koneksi encoder dan beri routing-mark ke to_wan1
+add chain=prerouting src-address-list=LIVE_ENCODER connection-mark=no-mark action=mark-connection new-connection-mark=conn_live passthrough=yes comment="PCC-Mark-Encoder-Conn"
+add chain=prerouting connection-mark=conn_live action=mark-routing new-routing-mark=to_wan1 passthrough=no comment="PCC-Route-Encoder-to_WAN1"
+
+# =========================
+# 6) PCC proporsional 2:2:1 (total 5 bucket) untuk trafik umum (kecuali encoder)
+#     menggunakan both-addresses-and-ports:5/x (lebih adil per-flow)
+# =========================
+# WAN1 buckets (0,1)
+add chain=prerouting src-address-list=!LIVE_ENCODER in-interface=$LANBR connection-mark=no-mark per-connection-classifier=both-addresses-and-ports:5/0 action=mark-connection new-connection-mark=wan1_conn passthrough=yes comment="PCC-5-0->WAN1"
+add chain=prerouting src-address-list=!LIVE_ENCODER in-interface=$LANBR connection-mark=no-mark per-connection-classifier=both-addresses-and-ports:5/1 action=mark-connection new-connection-mark=wan1_conn passthrough=yes comment="PCC-5-1->WAN1"
+# WAN2 buckets (2,3)
+add chain=prerouting src-address-list=!LIVE_ENCODER in-interface=$LANBR connection-mark=no-mark per-connection-classifier=both-addresses-and-ports:5/2 action=mark-connection new-connection-mark=wan2_conn passthrough=yes comment="PCC-5-2->WAN2"
+add chain=prerouting src-address-list=!LIVE_ENCODER in-interface=$LANBR connection-mark=no-mark per-connection-classifier=both-addresses-and-ports:5/3 action=mark-connection new-connection-mark=wan2_conn passthrough=yes comment="PCC-5-3->WAN2"
+# WAN3 bucket (4)
+add chain=prerouting src-address-list=!LIVE_ENCODER in-interface=$LANBR connection-mark=no-mark per-connection-classifier=both-addresses-and-ports:5/4 action=mark-connection new-connection-mark=wan3_conn passthrough=yes comment="PCC-5-4->WAN3"
+
+# =========================
+# 7) Mark-routing berdasarkan connection-mark (trafik dari LAN)
+# =========================
+add chain=prerouting connection-mark=wan1_conn in-interface=$LANBR action=mark-routing new-routing-mark=to_WAN1 passthrough=no comment="PCC-Route-mark-WAN1"
+add chain=prerouting connection-mark=wan2_conn in-interface=$LANBR action=mark-routing new-routing-mark=to_WAN2 passthrough=no comment="PCC-Route-mark-WAN2"
+add chain=prerouting connection-mark=wan3_conn in-interface=$LANBR action=mark-routing new-routing-mark=to_WAN3 passthrough=no comment="PCC-Route-mark-WAN3"
+
+# =========================
+# 8) ROUTES: PCC routes + encoder failover routes
+# =========================
+/ip route
+# PCC routes (for marked traffic)
+add dst-address=0.0.0.0/0 gateway=$GW1 routing-mark=to_WAN1 check-gateway=ping comment="PCC-LB to WAN1"
+add dst-address=0.0.0.0/0 gateway=$GW2 routing-mark=to_WAN2 check-gateway=ping comment="PCC-LB to WAN2"
+add dst-address=0.0.0.0/0 gateway=$GW3 routing-mark=to_WAN3 check-gateway=ping comment="PCC-LB to WAN3"
+
+# Encoder special routes (routing-mark=to_wan1) with failover priorities
+add dst-address=0.0.0.0/0 gateway=$GW1 routing-mark=to_wan1 distance=1 check-gateway=ping comment="Encoder primary -> WAN1"
+add dst-address=0.0.0.0/0 gateway=$GW2 routing-mark=to_wan1 distance=2 check-gateway=ping comment="Encoder fallback -> WAN2"
+add dst-address=0.0.0.0/0 gateway=$GW3 routing-mark=to_wan1 distance=3 check-gateway=ping comment="Encoder fallback2 -> WAN3"
+
+# Default routes for router-origin traffic (non-marked)
+add dst-address=0.0.0.0/0 gateway=$GW1 distance=1 check-gateway=ping comment="Default main via WAN1"
+add dst-address=0.0.0.0/0 gateway=$GW2 distance=2 check-gateway=ping comment="Default backup via WAN2"
+add dst-address=0.0.0.0/0 gateway=$GW3 distance=3 check-gateway=ping comment="Default 2nd backup via WAN3"
+
+# =========================
+# 9) Simple Queue: PRIORITY QUEUE for LIVE_ENCODER group
+# =========================
+# Sesuaikan min-limit/limit-at sesuai kebutuhan total encoder upload
+/queue simple
+add name="LIVE_ENCODER_Q" target=192.168.20.0/24 min-limit=50M/50M max-limit=200M/200M priority=1/1 comment="LIVE_ENCODER_Q"
+
+# =========================
+# 10) Auto Simple Queue per-device (12M) - script + scheduler
+#     - Skip IP yang termasuk LIVE_ENCODER
+#     - Nama queue: Q_<IP> ; comment="AUTOQ"
+# =========================
+/system script
+add name="auto-queue-12M" policy=ftp,reboot,read,write,policy,test,password,sniff,sensitive source="
+:log info \"auto-queue-12M running\";
+# hapus dulu queue AUTOQ lama
+:foreach q in=[/queue simple find where comment~\"AUTOQ\"] do={
+  /queue simple remove \$q;
+}
+# buat queue berdasarkan DHCP leases (yang status bound)
+:foreach l in=[/ip dhcp-server lease find where status==\"bound\"] do={
+  :local ip [/ip dhcp-server lease get \$l address];
+  # skip encoder subnet
+  :if ([:len [/ip firewall address-list find list=LIVE_ENCODER address=\$ip]] > 0) do={
+    :log info (\"skip encoder \" . \$ip);
+  } else={
+    :local qname (\"Q_\" . \$ip);
+    # buat queue jika belum ada
+    :if ([:len [/queue simple find name=\$qname]] == 0) do={
+      /queue simple add name=\$qname target=\$ip max-limit=12M/12M priority=2/2 comment=\"AUTOQ\";
+      :log info (\"created queue \" . \$qname . \" for \" . \$ip);
+    } else={
+      :log info (\"queue exists \" . \$qname);
+    }
+  }
+}
+"
+
+# scheduler: jalankan tiap 1 menit (sesuaikan interval jika perlu)
+:do {
+  /system scheduler remove [find name="auto-queue-12M"]
+} on-error={}
+add name="auto-queue-12M" interval=1m on-event="/system script run auto-queue-12M" comment="Recreate auto 12M queues"
+
+:log info "PCC + Auto SimpleQueue script applied"
