@@ -1,0 +1,23 @@
+# Hapus queue lama yang sudah tidak ada di DHCP leases
+:foreach q in=[/queue simple find where comment="auto-device"] do={
+    :local ip [/queue simple get $q target]
+    :if ([:len [/ip dhcp-server lease find where address="$ip"]] = 0) do={
+        /queue simple remove $q
+    }
+}
+
+# Tambah queue untuk device DHCP aktif di 192.168.20.0/24 yang belum ada
+:foreach lease in=[/ip dhcp-server lease find where status="bound" and address~"192.168.20."] do={
+    :local ip [/ip dhcp-server lease get $lease address]
+    :if ([:len [/queue simple find where target="$ip/32"]] = 0) do={
+        /queue simple add name="$ip" target="$ip/32" max-limit=12M/12M comment="auto-device"
+    }
+}
+
+
+
+/system script add name="auto-queue-device" source="(tempel script di atas)"
+
+
+
+/system scheduler add name="auto-queue-device" interval=1m on-event="/system script run auto-queue-device"
