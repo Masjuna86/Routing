@@ -1,0 +1,105 @@
+# ===========================
+# PCC 3 ISP (2:2:1) + Encoder Failover
+# RouterOS v7 (RB4011)
+# ===========================
+
+# === 0) Hati-hati: backup dulu konfigurasi router sebelum menjalankan script ini ===
+
+# 1) Bersihkan rule terkait (opsional, aman jika memang ingin replace)
+:log info "Start apply PCC+Encoder-Failover script"
+/ip firewall mangle remove [find]
+/ip firewall nat remove [find where comment~"NAT WAN"]
+/ip firewall address-list remove [find list=LIVE_ENCODER]
+/ip firewall address-list remove [find list=RFC1918]
+/ip route remove [find comment~"PCC-LB"]
+/queue tree remove [find comment~"LIVE_ENCODER"]
+
+# 2) Interface list untuk LAN (sesuaikan bila nama bridge berbeda)
+# (tambahkan saja, jika sudah ada maka Mikrotik akan menolak duplikat — itu aman)
+:do { /interface list add name=LAN comment="LAN list" } on-error={}
+
+/interface list member
+:do { /interface list member add list=LAN interface=Client comment="bridge Client (if exists)" } on-error={}
+:do { /interface list member add list=LAN interface=bridge comment="generic bridge (if exists)" } on-error={}
+
+# 3) Address-lists
+/ip firewall address-list
+add list=RFC1918 address=10.0.0.0/8
+add list=RFC1918 address=172.16.0.0/12
+add list=RFC1918 address=192.168.0.0/16
+
+# Semua encoder Live berada di subnet ini (ubah jika beda)
+add list=LIVE_ENCODER address=192.168.20.0/24 comment="Semua encoder Live"
+
+# 4) Bypass trafik lokal dan ke router
+/ip firewall mangle
+add chain=prerouting src-address-list=RFC1918 dst-address-list=RFC1918 action=accept comment="Bypass LAN<->LAN"
+add chain=prerouting dst-address-type=local action=accept comment="Bypass to router"
+
+# 5) Stickiness: tandai koneksi masuk dari tiap WAN (agar reply balik lewat jalur sama)
+add chain=prerouting in-interface="ether1-WAN1" connection-mark=no-mark action=mark-connection new-connection-mark=wan1_conn passthrough=yes comment="Stickiness IN WAN1"
+add chain=prerouting in-interface="ether2-WAN2" connection-mark=no-mark action=mark-connection new-connection-mark=wan2_conn passthrough=yes comment="Stickiness IN WAN2"
+add chain=prerouting in-interface="ether3-WAN3" connection-mark=no-mark action=mark-connection new-connection-mark=wan3_conn passthrough=yes comment="Stickiness IN WAN3"
+
+# 6) PRIORITAS ENCODER: mark connection + mark routing ke routing-mark "to_wan1"
+#    *Rencana failover: akan ada route tambahan untuk routing-mark=to_wan1 dengan distance bertingkat
+add chain=prerouting src-address-list=LIVE_ENCODER connection-mark=no-mark action=mark-connection new-connection-mark=conn_live passthrough=yes comment="Mark koneksi encoder"
+add chain=prerouting connection-mark=conn_live action=mark-routing new-routing-mark=to_wan1 passthrough=no comment="Routing encoder -> to_wan1"
+
+# 7) PCC PROPORSIONAL untuk trafik umum (selain LIVE_ENCODER)
+#    Proporsi 2:2:1 => total 5 bucket (0..4) => buckets 0,1 -> WAN1 ; 2,3 -> WAN2 ; 4 -> WAN3
+#    gunakan both-addresses-and-ports untuk distribusi yang lebih adil
+add chain=prerouting src-address-list=!LIVE_ENCODER in-interface-list=LAN connection-mark=no-mark per-connection-classifier=both-addresses-and-ports:5/0 action=mark-connection new-connection-mark=wan1_conn passthrough=yes comment="PCC 5/0 -> WAN1"
+add chain=prerouting src-address-list=!LIVE_ENCODER in-interface-list=LAN connection-mark=no-mark per-connection-classifier=both-addresses-and-ports:5/1 action=mark-connection new-connection-mark=wan1_conn passthrough=yes comment="PCC 5/1 -> WAN1"
+add chain=prerouting src-address-list=!LIVE_ENCODER in-interface-list=LAN connection-mark=no-mark per-connection-classifier=both-addresses-and-ports:5/2 action=mark-connection new-connection-mark=wan2_conn passthrough=yes comment="PCC 5/2 -> WAN2"
+add chain=prerouting src-address-list=!LIVE_ENCODER in-interface-list=LAN connection-mark=no-mark per-connection-classifier=both-addresses-and-ports:5/3 action=mark-connection new-connection-mark=wan2_conn passthrough=yes comment="PCC 5/3 -> WAN2"
+add chain=prerouting src-address-list=!LIVE_ENCODER in-interface-list=LAN connection-mark=no-mark per-connection-classifier=both-addresses-and-ports:5/4 action=mark-connection new-connection-mark=wan3_conn passthrough=yes comment="PCC 5/4 -> WAN3"
+
+# 8) Mark-routing untuk trafik dari LAN berdasarkan connection-mark
+add chain=prerouting in-interface-list=LAN connection-mark=wan1_conn action=mark-routing new-routing-mark=to_WAN1 passthrough=no comment="Route-mark WAN1"
+add chain=prerouting in-interface-list=LAN connection-mark=wan2_conn action=mark-routing new-routing-mark=to_WAN2 passthrough=no comment="Route-mark WAN2"
+add chain=prerouting in-interface-list=LAN connection-mark=wan3_conn action=mark-routing new-routing-mark=to_WAN3 passthrough=no comment="Route-mark WAN3"
+
+# 9) Mark-packet untuk encoder agar bisa dijadikan objek di queue tree
+#    - Upload: paket yang berasal dari encoder (postrouting lebih tepat untuk upload)
+#    - Download: paket yang menuju encoder (prerouting)
+add chain=postrouting src-address-list=LIVE_ENCODER action=mark-packet new-packet-mark=live_upload passthrough=yes comment="Mark packet upload encoder"
+add chain=prerouting dst-address-list=LIVE_ENCODER action=mark-packet new-packet-mark=live_download passthrough=yes comment="Mark packet download encoder"
+
+# 10) NAT per-WAN (masquerade) — wajib untuk NAT sesuai out-interface
+/ip firewall nat
+add chain=srcnat out-interface="ether1-WAN1" action=masquerade comment="NAT WAN1"
+add chain=srcnat out-interface="ether2-WAN2" action=masquerade comment="NAT WAN2"
+add chain=srcnat out-interface="ether3-WAN3" action=masquerade comment="NAT WAN3"
+
+# 11) ROUTES untuk PCC dan FAILOVER
+#    - Untuk trafik yang punya routing-mark to_WANx, route utama via gateway masing-masing
+#    - Tambahkan route tambahan untuk routing-mark=to_wan1 (encoder) dengan distance bertingkat
+#      sehingga jika gateway WAN1 down, encoder akan gunakan WAN2 (distance 2) lalu WAN3 (distance 3)
+/ip route
+# PCC routes (untuk trafik umum)
+add dst-address=0.0.0.0/0 gateway=172.16.10.1 routing-mark=to_WAN1 check-gateway=ping comment="PCC-LB to WAN1"
+add dst-address=0.0.0.0/0 gateway=172.16.20.1 routing-mark=to_WAN2 check-gateway=ping comment="PCC-LB to WAN2"
+add dst-address=0.0.0.0/0 gateway=172.16.30.1 routing-mark=to_WAN3 check-gateway=ping comment="PCC-LB to WAN3"
+
+# Encoder special routes (routing-mark=to_wan1) with failover priorities:
+add dst-address=0.0.0.0/0 gateway=172.16.10.1 routing-mark=to_wan1 distance=1 check-gateway=ping comment="Encoder primary -> WAN1"
+add dst-address=0.0.0.0/0 gateway=172.16.20.1 routing-mark=to_wan1 distance=2 check-gateway=ping comment="Encoder fallback -> WAN2"
+add dst-address=0.0.0.0/0 gateway=172.16.30.1 routing-mark=to_wan1 distance=3 check-gateway=ping comment="Encoder fallback2 -> WAN3"
+
+# Default routes for router-origin traffic (non-marked), with failover
+add dst-address=0.0.0.0/0 gateway=172.16.10.1 distance=1 check-gateway=ping comment="Default main via WAN1"
+add dst-address=0.0.0.0/0 gateway=172.16.20.1 distance=2 check-gateway=ping comment="Default backup via WAN2"
+add dst-address=0.0.0.0/0 gateway=172.16.30.1 distance=3 check-gateway=ping comment="Default 2nd backup via WAN3"
+
+# 12) Queue Tree untuk jaminan bandwidth encoder
+#     Atur nilai sesuai kebutuhan — di sini saya sediakan: guaranteed 200M upload total untuk encoder, max 1000M
+/queue tree
+add name="LIVE_UPLOAD" parent=global packet-mark=live_upload priority=1 max-limit=1000M limit-at=200M comment="LIVE_ENCODER Upload Prioritas"
+add name="LIVE_DOWNLOAD" parent=global packet-mark=live_download priority=1 max-limit=500M limit-at=50M comment="LIVE_ENCODER Download Prioritas"
+
+# 13) Matikan FastTrack jika aktif (agar mangle dan queue berfungsi)
+/ip firewall filter
+:do { /ip firewall filter remove [find where action="fasttrack-connection"] } on-error={}
+
+:log info "PCC + Encoder-Failover script applied successfully"
