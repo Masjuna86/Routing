@@ -1,0 +1,48 @@
+# 1. Nama interface
+/interface set ether1 name=wan1
+/interface set ether2 name=wan2
+/interface set ether4 name=lan-trunk
+
+# 2. Buat VLAN 222
+/interface vlan add name=vlan222 vlan-id=222 interface=lan-trunk
+
+# 3. IP Address
+/ip address
+add address=192.168.1.3/24 interface=wan1
+add address=192.168.4.5/24 interface=wan2
+add address=172.16.88.1/24 interface=vlan222
+
+# 4. Routing dengan distance dan deteksi failover
+/ip route
+add dst-address=0.0.0.0/0 gateway=192.168.1.1 distance=1 check-gateway=ping
+add dst-address=0.0.0.0/0 gateway=192.168.4.1 distance=1 check-gateway=ping
+
+# ⚠️ Penting: distance SAMA (1) agar keduanya bisa aktif (load balance)
+# check-gateway=ping → otomatis nonaktifkan rute jika gateway tidak merespons
+
+# 5. Mangle untuk PCC (load balance berdasarkan koneksi)
+/ip firewall mangle
+add chain=prerouting in-interface=vlan222 connection-mark=no-mark \
+    per-connection-classifier=both-addresses:2/0 \
+    action=mark-connection new-connection-mark=wan1_conn passthrough=yes
+
+add chain=prerouting in-interface=vlan222 connection-mark=no-mark \
+    per-connection-classifier=both-addresses:2/1 \
+    action=mark-connection new-connection-mark=wan2_conn passthrough=yes
+
+# Mark routing
+add chain=prerouting in-interface=vlan222 connection-mark=wan1_conn \
+    action=mark-routing new-routing-mark=to_wan1 passthrough=no
+
+add chain=prerouting in-interface=vlan222 connection-mark=wan2_conn \
+    action=mark-routing new-routing-mark=to_wan2 passthrough=no
+
+# 6. NAT Masquerade
+/ip firewall nat
+add chain=srcnat out-interface=wan1 action=masquerade
+add chain=srcnat out-interface=wan2 action=masquerade
+
+# 7. (Opsional) DHCP Server untuk VLAN 222
+/ip pool add name=dhcp_v222 ranges=172.16.88.10-172.16.88.250
+/ip dhcp-server add name=dhcp_v222 interface=vlan222 address-pool=dhcp_v222 disabled=no
+/ip dhcp-server network add address=172.16.88.0/24 gateway=172.16.88.1 dns-server=8.8.8.8,1.1.1.1
